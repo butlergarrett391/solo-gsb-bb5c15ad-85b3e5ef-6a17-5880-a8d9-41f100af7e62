@@ -12,8 +12,9 @@
 - 区间校验：end < start、越界（end >= object_length、负 start）；
 - 长度校验：length 与区间不一致、Base64 解码字节数与声明长度不符；
 - Base64：非法填充、URL-safe 字母表拒绝；
-- content_type：空值、缺斜杠、CR/LF 注入、非 ASCII、非法参数等拒绝；
-  合法参数（含 charset、quoted-string）原样保留；
+- content_type：空值、缺斜杠、CR/LF 注入、非 ASCII、非法参数、未闭合引号、
+  悬空反斜杠等拒绝；合法参数（含 charset、quoted-string 内的 ";" 与反斜杠
+  转义）原样保留；
 - 字段校验：缺字段、错误类型返回 422 invalid_request；
 - 错误响应不回显 data_b64。
 
@@ -362,6 +363,108 @@ class RangeResponseTests(unittest.TestCase):
         body = base64.b64decode(out["body_b64"])
         self.assertEqual(body.count(f"Content-Type: {ct}\r\n".encode()), 2)
 
+    def test_content_type_semicolon_inside_quoted_string_accepted(self) -> None:
+        # 引号内的 ";" 不是参数分隔符：修复前会被朴素 split 误报 422。
+        ct = 'application/example; profile="a;b"'
+        resp = self.post(self.request([self.rng(0, 0, 9)], content_type=ct))
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["headers"]["Content-Type"], ct)
+
+    def test_content_type_multiple_params_after_quoted_semicolon(self) -> None:
+        ct = 'application/example; profile="a;b;c"; charset=utf-8'
+        out = self.post(
+            self.request([self.rng(0, 0, 9)], content_type=ct)
+        ).json()
+        self.assertEqual(out["headers"]["Content-Type"], ct)
+
+    def test_content_type_quoted_semicolon_preserved_in_each_part(self) -> None:
+        ct = 'application/example; profile="a;b"'
+        out = self.post(
+            self.request([self.rng(0, 0, 9), self.rng(1, 10, 19)], content_type=ct)
+        ).json()
+        body = base64.b64decode(out["body_b64"])
+        self.assertEqual(body.count(f"Content-Type: {ct}\r\n".encode()), 2)
+        # 引号外的每段头结构完好：两段 Content-Range 均能在引号内 ";"
+        # 之后继续解析，且各恰好一个 Content-Type 头。
+        self.assertEqual(body.count(b"Content-Type: "), 2)
+        self.assertIn(b"Content-Range: bytes 0-9/256\r\n\r\n", body)
+        self.assertIn(b"Content-Range: bytes 10-19/256\r\n\r\n", body)
+
+    def test_content_type_backslash_escapes_inside_quoted_string(self) -> None:
+        # 引号内 \" 与 \\ 是合法 quoted-pair，且原值（含反斜杠）原样保留。
+        for ct in (
+            'application/x; title="say \\"hi\\""',
+            'application/x; path="C:\\\\dir\\\\file"',
+            'application/x; tab="a\\\tb"',
+        ):
+            with self.subTest(ct=ct):
+                resp = self.post(self.request([self.rng(0, 0, 9)], content_type=ct))
+                self.assertEqual(resp.status_code, 200, resp.text)
+                self.assertEqual(resp.json()["headers"]["Content-Type"], ct)
+
+    def test_content_type_ows_trimmed_but_value_kept_verbatim(self) -> None:
+        # 仅去除首尾 OWS；参数内部（含引号内空格）逐字节保留。
+        ct = ' application/example ; profile="a ; b" '
+        out = self.post(
+            self.request([self.rng(0, 0, 9)], content_type=ct)
+        ).json()
+        self.assertEqual(
+            out["headers"]["Content-Type"], 'application/example ; profile="a ; b"'
+        )
+
+    def test_content_type_unclosed_quote_rejected(self) -> None:
+        detail = self.err(
+            self.post(
+                self.request(
+                    [self.rng(0, 0, 9)],
+                    content_type='application/x; profile="unclosed',
+                )
+            ),
+            "invalid_content_type",
+        )
+        self.assertEqual(detail["loc"], "content_type")
+
+    def test_content_type_dangling_backslash_rejected(self) -> None:
+        # 引号内末尾悬空反斜杠、引号外裸反斜杠均拒绝，且错误定位 content_type。
+        for bad in (
+            'application/x; profile="dangling\\',
+            "application/x; x=1\\",
+        ):
+            with self.subTest(bad=bad):
+                resp = self.post(
+                    self.request([self.rng(0, 0, 9)], content_type=bad)
+                )
+                self.assertEqual(resp.status_code, 422)
+                self.assertEqual(resp.json()["error"], "invalid_content_type")
+                self.assertEqual(
+                    resp.json()["detail"][0]["loc"], "content_type"
+                )
+
+    def test_content_type_junk_after_quoted_string_rejected(self) -> None:
+        # 闭合引号之后紧跟杂字符不是合法参数值。
+        resp = self.post(
+            self.request(
+                [self.rng(0, 0, 9)],
+                content_type='application/x; x="v"junk',
+            )
+        )
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["detail"][0]["loc"], "content_type")
+
+    def test_content_type_control_char_in_quoted_string_rejected(self) -> None:
+        # quoted-string 内裸 NUL 与 quoted-pair 后跟控制字符都非法
+        #（quoted-pair 仅允许 SP / HTAB / VCHAR）。
+        for bad in (
+            'application/x; title="bad\x00"',
+            'application/x; title="bad\\\x00"',
+        ):
+            with self.subTest(bad=bad):
+                resp = self.post(
+                    self.request([self.rng(0, 0, 9)], content_type=bad)
+                )
+                self.assertEqual(resp.status_code, 422)
+                self.assertEqual(resp.json()["error"], "invalid_content_type")
+
     def test_content_type_empty_rejected(self) -> None:
         resp = self.post(self.request([self.rng(0, 0, 9)], content_type="   "))
         self.assertEqual(resp.status_code, 422)
@@ -391,7 +494,13 @@ class RangeResponseTests(unittest.TestCase):
         self.assertEqual(resp.json()["error"], "invalid_content_type")
 
     def test_content_type_bad_parameter_rejected(self) -> None:
-        for bad in ("a/b; badparam", 'a/b; x="unclosed', "a/b; ; x=1"):
+        for bad in (
+            "a/b; badparam",
+            'a/b; x="unclosed',
+            "a/b; ; x=1",
+            "a/b; x=1\\",
+            'a/b; x="a"b',
+        ):
             with self.subTest(bad=bad):
                 resp = self.post(self.request([self.rng(0, 0, 9)], content_type=bad))
                 self.assertEqual(resp.status_code, 422)

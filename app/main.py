@@ -20,7 +20,10 @@ Content-Range；多段时按 ranges 下标顺序生成严格 CRLF 分帧的
 multipart/byteranges，每段附 Content-Type 与 Content-Range。服务先校验
 下标恰好覆盖 0..N-1、区间在对象内且每段 Base64 解码字节数等于声明长度；
 Content-Length 按最终二进制正文计算，multipart boundary 随机生成并保证
-不会与任何正文分隔行冲突。
+不会与任何正文分隔行冲突。content_type 按 RFC 9110 媒体类型语法校验：
+参数只在引号外的 ";" 处切分，quoted-string 中的 ";" 与反斜杠转义
+（\"、\\ 等）被完整识别并原样写入响应头；未闭合引号、悬空反斜杠、
+CR/LF 或非法参数均返回带 content_type 定位的 422。
 
 POST /verify-fetch-batch 校验按 /plan 的 blocks 逐块回源得到的上游
 206 响应：接收 /plan 返回的 blocks、object_length，以及按块编号提供的
@@ -1765,6 +1768,8 @@ _BOUNDARY_RE = re.compile(r"^[0-9A-Za-z'()+_,-./:=?]{1,70}$")
 _TOKEN_RE = re.compile(rb"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 # quoted-string 取值（不含外层引号）：qdtext（含 tab）或 quoted-pair。
 _QUOTED_VALUE_RE = re.compile(rb'^(?:[\t\x20-\x21\x23-\x5b\x5d-\x7e]|\\[\t\x20-\x7e])*$')
+# 完整 quoted-string（含外层引号），用于 /range-response 的 content_type 参数。
+_QUOTED_STRING_RE = re.compile(rb'^"(?:[\t\x20-\x21\x23-\x5b\x5d-\x7e]|\\[\t\x20-\x7e])*"$')
 # Content-Range: bytes <start>-<end>/<total>（仅数字 total，不接受 *）。
 _CONTENT_RANGE_RE = re.compile(rb"^bytes[ \t]+(\d+)-(\d+)/(\d+)$")
 _CRLF = b"\r\n"
@@ -2354,13 +2359,73 @@ def _decode_b64_range(raw: str, loc: str, range_index: int) -> bytes:
         )
 
 
+def _split_media_type_params(value: bytes) -> list[bytes]:
+    """仅在引号外按 ``;`` 切分媒体类型，识别 quoted-string 与反斜杠转义。
+
+    RFC 9110 的媒体类型参数值可以是 quoted-string，其中允许出现 ``;`` 与
+    ``"``（后者以反斜杠转义），因此不能朴素地 ``split(b";")``。扫描规则：
+      - 引号外的 ``;`` 才是参数分隔符，引号内的 ``;`` 原样保留在该参数段；
+      - 进入引号后，``\\`` 按 quoted-pair 处理（与紧随其后的一个字符一并
+        跳过），直到遇到未转义的闭合引号；引号未闭合一律拒绝；
+      - 引号内 ``\\`` 位于末尾（没有被转义字符）即为悬空反斜杠，拒绝；
+      - 引号外的裸 ``\\`` 没有转义语义，直接拒绝（token 校验同样不接受）。
+    """
+    segments: list[bytes] = []
+    start = 0
+    i = 0
+    total = len(value)
+    while i < total:
+        ch = value[i]
+        if ch == 0x3B:  # ";"：仅引号外是参数分隔符
+            segments.append(value[start:i])
+            start = i + 1
+            i += 1
+            continue
+        if ch == 0x22:  # DQUOTE：跨过完整 quoted-string（含反斜杠转义）
+            i += 1
+            while i < total:
+                if value[i] == 0x5C:  # "\\"：必须带一个被转义字符
+                    if i + 1 >= total:
+                        raise RangeResponseError(
+                            "content_type 参数 quoted-string 非法：反斜杠后缺少"
+                            "被转义字符（悬空反斜杠）",
+                            "content_type",
+                            code="invalid_content_type",
+                        )
+                    i += 2
+                    continue
+                if value[i] == 0x22:  # 未转义的闭合引号
+                    i += 1
+                    break
+                i += 1
+            else:
+                raise RangeResponseError(
+                    "content_type 参数 quoted-string 未闭合",
+                    "content_type",
+                    code="invalid_content_type",
+                )
+            continue
+        if ch == 0x5C:  # 引号外的裸反斜杠没有转义语义
+            raise RangeResponseError(
+                "content_type 参数值非法：反斜杠只能作为 quoted-string 内的"
+                "转义引导出现",
+                "content_type",
+                code="invalid_content_type",
+            )
+        i += 1
+    segments.append(value[start:])
+    return segments
+
+
 def _validate_media_type(raw: str) -> str:
     """校验 content_type 是合法的 HTTP 媒体类型并返回去首尾 OWS 后的原值。
 
     接受 `token "/" token *( OWS ";" OWS parameter )`，参数值为 token 或
-    quoted-string；拒绝空值、非 ASCII、CR/LF、非法 token、非法参数，防止
-    调用方通过该字段实施响应头注入。返回时保留调用方给定的大小写与参数
-    形式，仅去除首尾 OWS。
+    quoted-string；参数只在引号外的 ``;`` 处切分（quoted-string 内的 ``;``
+    与 ``\\"``/``\\\\`` 等反斜杠转义被完整识别并原样保留）；拒绝空值、非
+    ASCII、CR/LF、未闭合引号、悬空反斜杠、非法 token、非法参数，防止调用
+    方通过该字段实施响应头注入。返回时保留调用方给定的大小写与参数形式，
+    仅去除首尾 OWS。
     """
     if any(ch in raw for ch in "\r\n"):
         raise RangeResponseError(
@@ -2383,7 +2448,8 @@ def _validate_media_type(raw: str) -> str:
             "content_type",
             code="invalid_content_type",
         )
-    segments = value.split(b";")
+    # 只在引号外切分参数：quoted-string 中的 ";" 不是分隔符。
+    segments = _split_media_type_params(value)
     main_type = segments[0].strip(b" \t")
     parts = main_type.split(b"/")
     if (
@@ -2413,8 +2479,10 @@ def _validate_media_type(raw: str) -> str:
                 "content_type",
                 code="invalid_content_type",
             )
-        if pvalue.startswith(b'"') and pvalue.endswith(b'"'):
-            if len(pvalue) < 2 or not _QUOTED_VALUE_RE.fullmatch(pvalue[1:-1]):
+        if pvalue.startswith(b'"'):
+            # 必须是一个完整的 quoted-string（扫描器已识别引号配对，但还需
+            # 确认闭合引号之后没有尾随杂字符，且内部字符全部合法）。
+            if not _QUOTED_STRING_RE.fullmatch(pvalue):
                 raise RangeResponseError(
                     "content_type 参数 quoted-string 非法",
                     "content_type",
