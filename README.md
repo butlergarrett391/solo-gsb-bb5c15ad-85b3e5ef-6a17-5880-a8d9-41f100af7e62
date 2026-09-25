@@ -331,7 +331,12 @@ docker run --rm -p 127.0.0.1:8080:8080 \
 3. `data_b64` 必须是含正确填充的标准 Base64（`validate=True`，拒绝
    URL-safe 字母表与夹杂空白），**解码字节数必须等于声明长度**；
 4. `content_type` 必须是合法 RFC 9110 媒体类型（参数值支持 token 或
-   quoted-string），拒绝空值、非 ASCII 与 CR/LF（防止响应头注入）。
+   quoted-string），参数只在**引号外**的分号处切分——quoted-string
+   内的分号不是分隔符（如 `application/example; profile="a;b"`），
+   并识别 `\"`、`\\` 等 quoted-pair 转义；拒绝空值、非 ASCII、CR/LF
+   （防止响应头注入）、未闭合引号、悬空反斜杠与非法参数。合法参数值
+   原样保留，逐字写入单段响应头与 multipart 各 part 的
+   `Content-Type`。
 
 #### 单段：直接输出范围字节
 

@@ -12,8 +12,10 @@
 - 区间校验：end < start、越界（end >= object_length、负 start）；
 - 长度校验：length 与区间不一致、Base64 解码字节数与声明长度不符；
 - Base64：非法填充、URL-safe 字母表拒绝；
-- content_type：空值、缺斜杠、CR/LF 注入、非 ASCII、非法参数等拒绝；
-  合法参数（含 charset、quoted-string）原样保留；
+- content_type：空值、缺斜杠、CR/LF 注入、非 ASCII、非法参数、未闭合
+  引号、悬空反斜杠等拒绝；合法参数（含 charset、quoted-string）原样
+  保留，quoted-string 内的分号不作参数分隔符、反斜杠转义按
+  quoted-pair 识别；
 - 字段校验：缺字段、错误类型返回 422 invalid_request；
 - 错误响应不回显 data_b64。
 
@@ -396,6 +398,61 @@ class RangeResponseTests(unittest.TestCase):
                 resp = self.post(self.request([self.rng(0, 0, 9)], content_type=bad))
                 self.assertEqual(resp.status_code, 422)
                 self.assertEqual(resp.json()["error"], "invalid_content_type")
+
+    def test_content_type_quoted_semicolon_not_a_separator(self) -> None:
+        # 引号内的分号不是参数分隔符：单段响应头原样保留。
+        ct = 'application/example; profile="a;b"'
+        resp = self.post(self.request([self.rng(0, 0, 9)], content_type=ct))
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["headers"]["Content-Type"], ct)
+
+    def test_content_type_quoted_semicolon_multipart_parts(self) -> None:
+        # 多段时每个 part 的 Content-Type 也原样保留带分号的参数值。
+        ct = 'application/example; profile="a;b"; x=1'
+        out = self.post(
+            self.request([self.rng(0, 0, 9), self.rng(1, 10, 19)], content_type=ct)
+        ).json()
+        body = base64.b64decode(out["body_b64"])
+        self.assertEqual(body.count(f"Content-Type: {ct}\r\n".encode()), 2)
+
+    def test_content_type_quoted_escapes_accepted(self) -> None:
+        # quoted-pair：\" 不结束引号，\; \\ 等转义合法，整段原样保留。
+        for ct in (
+            'a/b; x="a\\";b"',
+            'a/b; x="a\\;b"',
+            'a/b; x="\\\\"; y=1',
+            'a/b; x="a=b; c"; y=z',
+        ):
+            with self.subTest(ct=ct):
+                resp = self.post(self.request([self.rng(0, 0, 9)], content_type=ct))
+                self.assertEqual(resp.status_code, 200, resp.text)
+                self.assertEqual(resp.json()["headers"]["Content-Type"], ct)
+
+    def test_content_type_unclosed_quote_rejected(self) -> None:
+        for bad in ('a/b; x="unclosed', 'a/b; x="a; y=1', 'a/b; x="a\\"'):
+            with self.subTest(bad=bad):
+                resp = self.post(self.request([self.rng(0, 0, 9)], content_type=bad))
+                self.assertEqual(resp.status_code, 422)
+                self.assertEqual(resp.json()["error"], "invalid_content_type")
+                self.assertEqual(resp.json()["detail"][0]["loc"], "content_type")
+
+    def test_content_type_stray_quote_outside_value_rejected(self) -> None:
+        # 引号只能成对包裹整个参数值：值外的裸引号/引号间夹杂字符均拒绝。
+        for bad in ('a/b; x="a"b"', 'a/b; x=a"b;c"', 'a/b; "x=1"'):
+            with self.subTest(bad=bad):
+                resp = self.post(self.request([self.rng(0, 0, 9)], content_type=bad))
+                self.assertEqual(resp.status_code, 422)
+                self.assertEqual(resp.json()["error"], "invalid_content_type")
+                self.assertEqual(resp.json()["detail"][0]["loc"], "content_type")
+
+    def test_content_type_dangling_backslash_rejected(self) -> None:
+        # 悬空反斜杠（\ 后没有被转义字符）与非法转义字符一律 422。
+        for bad in ('a/b; x="abc\\', 'a/b; x="a\\\x7fb"'):
+            with self.subTest(bad=bad):
+                resp = self.post(self.request([self.rng(0, 0, 9)], content_type=bad))
+                self.assertEqual(resp.status_code, 422)
+                self.assertEqual(resp.json()["error"], "invalid_content_type")
+                self.assertEqual(resp.json()["detail"][0]["loc"], "content_type")
 
     # ----------------------------- 字段校验 -----------------------------
 
